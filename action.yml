@@ -1,5 +1,5 @@
-name: "R2 to GitHub"
-description: "Transfer files from Cloudflare R2 to GitHub repositories based on size or quantity strategy."
+name: "Storage to GitHub"
+description: "Transfer files from Cloudflare R2 and/or Backblaze B2 to GitHub repositories based on size or quantity strategy."
 author: "fscarmen2"
 inputs:
   config_path:
@@ -15,58 +15,77 @@ runs:
   steps:
     - name: Runing
       run: |
-        echo "开始 R2 ---> GitHub 脚本"
+        # 脚本开始，输出起始日志
+        echo "开始 Storage ---> GitHub 脚本"
 
-        # 读取配置文件内容并替换格式，确保冒号后有空格
+        # 读取并格式化配置文件，确保冒号后有空格，并移除特殊字符
         CONFIG=$(sed 's/[<>]//g; s/:/: /g; s/:[[:space:]]\+/: /g' "${{ inputs.config_path }}")
 
-        # 从配置文件中读取 Cloudflare R2 的相关参数
-        R2_ACCOUNT_NAME=($(yq '.r2_accounts[].name' <<< "$CONFIG")) # 获取所有 R2 的账户名称
-        R2_ACCOUNT_ID=($(yq '.r2_accounts[].account_id' <<< "$CONFIG")) # 获取所有 R2 的账户 ID
-        R2_ACCESS_KEY_ID=($(yq '.r2_accounts[].access_key_id' <<< "$CONFIG")) # 获取所有 R2 的访问密钥 ID
-        R2_SECRET_ACCESS_KEY=($(yq '.r2_accounts[].secret_access_key' <<< "$CONFIG")) # 获取所有 R2 的访问密钥
-        R2_BUCKET=($(yq '.r2_accounts[].bucket' <<< "$CONFIG")) # 获取所有 R2 的存储桶名称
-        R2_DIR=($(yq '.r2_accounts[].dir' <<< "$CONFIG")) # 获取所有 R2 的文件目录
-        for o in "${R2_ACCOUNT_ID[@]}"; do
-          R2_ENDPOINT_URL+=(https://${o}.r2.cloudflarestorage.com) # 为每个账户生成对应的 endpoint URL
-        done
+        # 检查并读取 R2 存储配置（如果存在）
+        if yq -e '.r2_accounts' <<< "$CONFIG" >/dev/null 2>&1; then
+          # 解析 R2 账户相关信息
+          R2_ACCOUNT_NAME=($(yq '.r2_accounts[].name' <<< "$CONFIG"))
+          R2_ACCOUNT_ID=($(yq '.r2_accounts[].account_id' <<< "$CONFIG"))
+          R2_ACCESS_KEY_ID=($(yq '.r2_accounts[].access_key_id' <<< "$CONFIG"))
+          R2_SECRET_ACCESS_KEY=($(yq '.r2_accounts[].secret_access_key' <<< "$CONFIG"))
+          R2_BUCKET=($(yq '.r2_accounts[].bucket' <<< "$CONFIG"))
+          R2_DIR=($(yq '.r2_accounts[].dir' <<< "$CONFIG"))
+          
+          # 构建 R2 存储的端点 URL
+          for o in "${R2_ACCOUNT_ID[@]}"; do
+            R2_ENDPOINT_URL+=(https://${o}.r2.cloudflarestorage.com)
+          done
+        fi
 
-        # 从配置文件中读取 GitHub 的相关参数
-        GITHUB_PAT=$(yq '.github_pat' <<< "$CONFIG")
-        GITHUB_REPO_PREFIX=$(yq '.github_repo_prefix' <<< "$CONFIG")
-        # 获取 GitHub 的仓库列表
-        GITHUB_REPO_LIST=($(yq '.gitlab_pats | keys | .[]' <<< "$CONFIG" | sed "s/^/${GITHUB_REPO_PREFIX}&/g"))
-        # 获取 GitHub 用户名
-        GITHUB_USERNAME=$(curl --silent --header "Authorization: Bearer $GITHUB_PAT" https://api.github.com/user | awk -F '"' '/"login":/{print $4}')
+        # 检查并读取 B2 存储配置（如果存在）
+        if yq -e '.b2_accounts' <<< "$CONFIG" >/dev/null 2>&1; then
+          # 解析 B2 账户相关信息
+          B2_ACCOUNT_NAME=($(yq '.b2_accounts[].name' <<< "$CONFIG"))
+          B2_ENDPOINT=($(yq '.b2_accounts[].endpoint' <<< "$CONFIG"))
+          B2_KEY_ID=($(yq '.b2_accounts[].key_id' <<< "$CONFIG"))
+          B2_APPLICATION_KEY=($(yq '.b2_accounts[].application_key' <<< "$CONFIG"))
+          B2_BUCKET=($(yq '.b2_accounts[].bucket' <<< "$CONFIG"))
+          B2_DIR=($(yq '.b2_accounts[].dir' <<< "$CONFIG"))
+          
+          # 构建 B2 存储的端点 URL
+          for p in "${B2_ENDPOINT[@]}"; do
+            B2_ENDPOINT_URL+=(https://${p})
+          done
+        fi
 
-        # 获取迁移策略
-        STRATEGY=$(yq '.strategy' <<< "$CONFIG")
+        # 从配置文件中读取 GitHub 相关参数
+        GITHUB_PAT=$(yq '.github_pat' <<< "$CONFIG")  # GitHub 个人访问令牌
+        GITHUB_REPO_PREFIX=$(yq '.github_repo_prefix' <<< "$CONFIG")  # GitHub 仓库前缀
+        GITHUB_REPO_LIST=($(yq '.gitlab_pats | keys | .[]' <<< "$CONFIG" | sed "s/^/${GITHUB_REPO_PREFIX}&/g"))  # 仓库列表
+        GITHUB_USERNAME=$(curl --silent --header "Authorization: Bearer $GITHUB_PAT" https://api.github.com/user | awk -F '"' '/"login":/{print $4}')  # GitHub 用户名
 
-        # 判断是否需要删除已迁移文件
-        DELETE=$(yq '.delete' <<< "$CONFIG")
+        # 获取迁移策略和是否删除原文件的配置
+        STRATEGY=$(yq '.strategy' <<< "$CONFIG")  # 迁移策略
+        DELETE=$(yq '.delete' <<< "$CONFIG")  # 是否删除已迁移文件
 
         # 检查策略是否直接指定了仓库
         for j in ${GITHUB_REPO_LIST[@]}; do
           grep -qw "${STRATEGY}" <<< "$j" && REPO_NAME="${STRATEGY}" && break
         done
 
-        # 如果策略直接指定了仓库
+        # 根据策略选择目标仓库
         if [ -n "$REPO_NAME" ]; then
-          STRATEGY_RESULT="策略: 指定存放到 ${REPO_NAME}" # 策略为指定仓库
+          STRATEGY_RESULT="策略: 指定存放到 ${REPO_NAME}"
         # 如果策略是基于文件数量的最少策略
         elif [ "${STRATEGY,,}" = 'quantity' ]; then
+          # 查找文件数量最少的仓库
           MIN_INDEX=0
           MIN_FILE_QUANTITY=$(curl --silent \
           --header "Authorization: token ${GITHUB_PAT}" \
           --header "Accept: application/vnd.github.v3+json" \
-          https://api.github.com/repos/${GITHUB_USERNAME}/${GITHUB_REPO_LIST[0]}/contents/${R2_DIR} | grep -c '"name"') # 获取第一个仓库的文件数量
+          https://api.github.com/repos/${GITHUB_USERNAME}/${GITHUB_REPO_LIST[0]}/contents/${R2_DIR} | grep -c '"name"')
 
           # 遍历仓库，找到文件数量最少的仓库
           for ((i=1; i<${#GITHUB_REPO_LIST[@]}; i++)); do
             REPO_FILE_QUANTITY[i]=$(curl --silent \
             --header "Authorization: token ${GITHUB_PAT}" \
             --header "Accept: application/vnd.github.v3+json" \
-            https://api.github.com/repos/${GITHUB_USERNAME}/${GITHUB_REPO_LIST[i]}/contents/${R2_DIR} | grep -c '"name"') # 获取其他仓库的文件数量
+            https://api.github.com/repos/${GITHUB_USERNAME}/${GITHUB_REPO_LIST[i]}/contents/${R2_DIR} | grep -c '"name"')
             if [[ "$MIN_FILE_QUANTITY" -gt "${REPO_FILE_QUANTITY[i]}" ]]; then
               MIN_FILE_QUANTITY="${REPO_FILE_QUANTITY[i]}"
               MIN_INDEX="$i"
@@ -97,85 +116,189 @@ runs:
           STRATEGY_RESULT="策略: 存放到仓库容量最少的 ${REPO_NAME}" # 选择容量最小的仓库
         fi
 
-        # 提交更改到 GitHub
-        git config --global user.name 'github-actions' # 设置 Git 用户名
-        git config --global user.email 'github-actions@github.com' # 设置 Git 用户邮箱
+        # Git 配置，使用 GitHub Actions 机器人身份
+        git config --global user.name 'github-actions'
+        git config --global user.email 'github-actions@github.com'
 
+        # AWS CLI 配置
+        aws configure set region auto
+        aws configure set output json
 
-        # 配置 AWS CLI 访问 Cloudflare R2 的凭据
-        aws configure set region auto # 配置默认区域
-        aws configure set output json # 设置输出格式为 JSON
+        # 处理 R2 存储（如果存在）
+        if [ ${#R2_ACCOUNT_NAME[@]} -gt 0 ]; then
+          # 遍历所有 R2 账户
+          for n in ${!R2_ACCOUNT_NAME[@]}; do
+            # 配置 AWS 凭据（用于访问 R2）
+            aws configure set aws_access_key_id ${R2_ACCESS_KEY_ID[n]}
+            aws configure set aws_secret_access_key ${R2_SECRET_ACCESS_KEY[n]}
 
-        for n in ${!R2_ACCOUNT_NAME[@]}; do
-          aws configure set aws_access_key_id ${R2_ACCESS_KEY_ID[n]}
-          aws configure set aws_secret_access_key ${R2_SECRET_ACCESS_KEY[n]}
+            # 获取 Cloudflare R2 中的所有文件列表及大小
+            unset FILE_DETAIL FILE_LIST FILE_VERSION_ID FILE_SIZE SUCCESS_UPDATE NEED_MOVE_FILE SKIP_FILE DELETE_FILE FILE_COUNTER
+            FILE_DETAIL_ALL=$(aws s3api list-objects-v2 \
+                            --endpoint-url="${R2_ENDPOINT_URL[n]}" \
+                            --bucket "${R2_BUCKET[n]}")
 
-          # 获取 Cloudflare R2 中的所有文件列表
-          unset FILE_LIST SUCCESS_UPDATE NEED_MOVE_FILE SKIP_FILE DELETE_FILE m
-          FILE_LIST=($(aws s3 ls --endpoint-url=${R2_ENDPOINT_URL[n]} s3://${R2_BUCKET[n]}/ --recursive | awk '{print $NF}'))
+            # 解析文件详情
+            grep -q '"Key"' <<< "${FILE_DETAIL_ALL}" && FILE_DETAIL=$(jq '.Contents[] | {Key, Size}' <<< "${FILE_DETAIL_ALL}")
+            if [ "$(jq -s 'length' <<< "${FILE_DETAIL}")" -gt 0 ]; then
+              FILE_LIST=($(jq -r '.Key' <<< "${FILE_DETAIL}"))
+              FILE_SIZE=($(jq -r '.Size' <<< "${FILE_DETAIL}"))
+            fi
 
-          # 如果有文件需要处理
-          if [ "${#FILE_LIST[@]}" -gt 0 ]; then
+            # 筛选文件：小于等于 100MB 的文件加入迁移列表
+            if [ "${#FILE_LIST[@]}" -gt 0 ]; then
+              for k in "${!FILE_LIST[@]}"; do
+                [ "${FILE_SIZE[k]}" -le 104857600 ] && NEED_MOVE_FILE+=(${FILE_LIST[k]}) || SKIP_FILE+=(${FILE_LIST[k]})
+              done
+            fi
 
-            # 克隆目标仓库
-            [ -d "${REPO_NAME}" ] || git clone --depth=1 https://${GITHUB_USERNAME}:${GITHUB_PAT}@github.com/${GITHUB_USERNAME}/${REPO_NAME}.git
-            cd ${REPO_NAME}
+            # 如果有需要迁移的文件，克隆目标仓库
+            if [ "${#NEED_MOVE_FILE[@]}" -gt 0 ]; then
+              [ ! -d "${REPO_NAME}" ] && echo "克隆节点 ${REPO_NAME}" && git clone --depth=1 https://${GITHUB_USERNAME}:${GITHUB_PAT}@github.com/${GITHUB_USERNAME}/${REPO_NAME}.git
+              cd ${REPO_NAME}
 
-            # 遍历文件列表，检查每个文件的大小
-            for k in "${FILE_LIST[@]}"; do
-              unset FILE_SIZE
-              FILE_SIZE=$(aws s3api head-object \
-                  --endpoint-url="${R2_ENDPOINT_URL[n]}" \
-                  --bucket "${R2_BUCKET[n]}" \
-                  --key "${k}" \
-                  --query "ContentLength" \
-                  --output text)
-              # 文件小于等于 100MB 的加入迁移列表
-              [ "${FILE_SIZE}" -le 104857600 ] && NEED_MOVE_FILE+=(${k}) || SKIP_FILE+=(${k})
-            done
+              # 下载符合条件的文件到本地
+              echo "================================="
+              for l in "${NEED_MOVE_FILE[@]}"; do
+                (( FILE_COUNTER++ )) || true
+                echo "${R2_ACCOUNT_NAME[n]} copying ${FILE_COUNTER} / ${#NEED_MOVE_FILE[@]} : ${l#*/}"
+                aws s3 cp --endpoint-url=${R2_ENDPOINT_URL[n]} s3://${R2_BUCKET[n]}/${l} ${l} >/dev/null
+                DELETE_FILE+=("--include \"${l}\"")
+              done
 
-            # 将符合条件的文件下载到本地
-            [ "${#NEED_MOVE_FILE}" -gt 0 ] && echo "================================="
-            for l in "${NEED_MOVE_FILE[@]}"; do
-              (( m++ )) || true
-              echo "${R2_ACCOUNT_NAME[n]} copying ${m} / ${#NEED_MOVE_FILE[@]} : ${l#*/}"
-              aws s3 cp --endpoint-url=${R2_ENDPOINT_URL[n]} s3://${R2_BUCKET[n]}/${l} ${l} >/dev/null
-              DELETE_FILE+=("--include \"${l}\"")
-            done
+              # 提交更改到 GitHub
+              git add .
+              git commit -m "Add images from Cloudflare R2 ${R2_ACCOUNT_NAME[n]}" || echo "No changes to commit"
+              git push -f && SUCCESS_UPDATE=true || echo "No changes to push"
+              cd ..
 
-            # 提交更改到 GitHub
-            git add .
-            git commit -m "Add images from Cloudflare R2 ${R2_ACCOUNT_NAME[n]}" || echo "No changes to commit"
-            git push -f && SUCCESS_UPDATE=true || echo "No changes to push"
-            cd ..
+              # 处理已成功更新的情况
+              if [ "${SUCCESS_UPDATE}" = 'true' ]; then
+                # 是否删除已迁移的文件
+                if [ "${DELETE,,}" = 'true' ]; then
+                  COPY_OR_MOVE='迁移'
+                  echo "Delete files from CloudFlare R2 ${R2_ACCOUNT_NAME[n]}"
+                  aws s3 rm --endpoint-url=${R2_ENDPOINT_URL[n]} s3://${R2_BUCKET[n]} --recursive --exclude "*" $(eval echo "${DELETE_FILE[@]}")
+                else
+                  COPY_OR_MOVE='复制'
+                fi
 
-            if [ "${SUCCESS_UPDATE}" = 'true' ]; then
-              # 删除已经迁移的文件
-              if [ "${DELETE,,}" = 'true' ]; then
-                COPY_OR_MOVE='迁移'
-                echo "Delete files from CloudFlare R2 ${R2_ACCOUNT_NAME[n]}"
-                aws s3 rm --endpoint-url=${R2_ENDPOINT_URL[n]} s3://${R2_BUCKET[n]} --recursive --exclude "*" $(eval echo "${DELETE_FILE[@]}")
+                # 记录操作报告
+                REPORT+="\n已成功${COPY_OR_MOVE} CloudFlare R2 ${R2_ACCOUNT_NAME[n]} ${#NEED_MOVE_FILE[@]} 个文件 ---> ${REPO_NAME}"
+                if [ "${#SKIP_FILE[@]}" -gt 0 ]; then
+                  [ "${#SKIP_FILE[@]}" = 1 ] && REPORT+="\nWarning: ${R2_ACCOUNT_NAME[n]} 1 个文件大于 100MB，不能${COPY_OR_MOVE}到 ${REPO_NAME}，是 ${SKIP_FILE[@]#*/}" || REPORT+="\nWarning: ${R2_ACCOUNT_NAME[n]} ${#SKIP_FILE[@]} 个文件大于 100MB，不能${COPY_OR_MOVE}到 ${REPO_NAME}，分别是 ${SKIP_FILE[@]#*/}"
+                fi
               else
-                COPY_OR_MOVE='复制'
-              fi
-
-              REPORT+="\n已成功${COPY_OR_MOVE} CloudFlare R2 ${R2_ACCOUNT_NAME[n]} ${#NEED_MOVE_FILE[@]} 个文件 ---> ${REPO_NAME}"
-              if [ "${#SKIP_FILE[@]}" -gt 0 ]; then
-                [ "${#SKIP_FILE[@]}" = 1 ] && REPORT+="\n1 个文件大于 100MB，不能${COPY_OR_MOVE}到 ${REPO_NAME}，是 ${SKIP_FILE[@]}" || REPORT+="\n${#SKIP_FILE[@]} 个文件大于 100MB，不能${COPY_OR_MOVE}到 ${REPO_NAME}，分别是 ${SKIP_FILE[@]}"
+                REPORT+="\nGitHub: ${REPO_NAME} 更新失败"
               fi
             else
-              REPORT+="\nGitHub: ${REPO_NAME} 更新失败"
+              # 如果没有文件需要处理
+              REPORT+="\nCloudFlare R2 ${R2_ACCOUNT_NAME[n]} 没有更新文件."
             fi
-          else
-            # 如果没有文件需要处理
-            REPORT+="\nCloudFlare R2 ${R2_ACCOUNT_NAME[n]} 没有更新文件."
-          fi
-        done
+          done
+        fi
 
-        # 本地删除节点仓库
+        # 处理 B2 存储（如果存在）
+        # 这部分代码逻辑与 R2 处理基本相同，主要区别在于处理 B2 存储的特定细节
+        if [ ${#B2_ACCOUNT_NAME[@]} -gt 0 ]; then
+          for n in ${!B2_ACCOUNT_NAME[@]}; do
+            aws configure set aws_access_key_id ${B2_KEY_ID[n]}
+            aws configure set aws_secret_access_key ${B2_APPLICATION_KEY[n]}
+
+            # 获取 B2 中的所有文件列表
+            unset FILE_DETAIL FILE_LIST FILE_SIZE SUCCESS_UPDATE NEED_MOVE_FILE SKIP_FILE DELETE_FILE FILE_COUNTER B2_DOWNLOAD_FAIL B2_DOWNLOAD_SUCCESS
+            FILE_DETAIL_ALL=$(aws s3api list-object-versions \
+                                --endpoint-url="${B2_ENDPOINT_URL[n]}" \
+                                --bucket "${B2_BUCKET[n]}")
+
+            grep -q '"Key"' <<< "${FILE_DETAIL_ALL}" && FILE_DETAIL=$(jq '.Versions[] | select(.Key | contains(".bzEmpty") | not) | {Size, Key, VersionId}' <<< "${FILE_DETAIL_ALL}")
+            if [ "$(jq -s 'length' <<< "${FILE_DETAIL}")" -gt 0 ]; then
+              FILE_LIST=($(jq -r '.Key' <<< "${FILE_DETAIL}"))
+              FILE_SIZE=($(jq -r '.Size' <<< "${FILE_DETAIL}"))
+              FILE_VERSION_ID=($(jq -r '.VersionId' <<< "${FILE_DETAIL}"))
+            fi
+
+            # 如果有文件需要处理，则遍历文件列表，检查每个文件的大小，文件小于等于 100MB ,并且大于 0b 的加入迁移列表
+            if [ "${#FILE_LIST[@]}" -gt 0 ]; then
+              for k in "${!FILE_LIST[@]}"; do
+                [ "${FILE_SIZE[k]}" -le 104857600 ] && NEED_MOVE_FILE+=(${FILE_LIST[k]}) || SKIP_FILE+=(${FILE_LIST[k]})
+              done
+            fi
+
+            # 如果有文件需要处理
+            if [ "${#NEED_MOVE_FILE[@]}" -gt 0 ]; then
+              # 克隆目标仓库
+              [ ! -d "${REPO_NAME}" ] && echo "克隆节点 ${REPO_NAME}" && git clone --depth=1 https://${GITHUB_USERNAME}:${GITHUB_PAT}@github.com/${GITHUB_USERNAME}/${REPO_NAME}.git
+              cd ${REPO_NAME}
+
+              # 将符合条件的文件下载到本地，并记录需要删除文件的 VersionId
+              B2_DOWNLOAD_FAIL=0
+              B2_DOWNLOAD_SUCCESS=0
+              echo "================================="
+              for l in "${NEED_MOVE_FILE[@]}"; do
+                (( FILE_COUNTER++ )) || true
+                echo "${B2_ACCOUNT_NAME[n]} copying ${FILE_COUNTER} / ${#NEED_MOVE_FILE[@]} : ${l#*/}"
+                B2_DOWNLOAD_QUOTA=$(aws s3 cp --endpoint-url=${B2_ENDPOINT_URL[n]} s3://${B2_BUCKET[n]}/${l} ${l} 2>&1) || true
+                if grep -q "operation: Forbidden" <<< "${B2_DOWNLOAD_QUOTA}"; then
+                  (( B2_DOWNLOAD_FAIL++ )) || true
+                  break
+                else
+                  (( B2_DOWNLOAD_SUCCESS++ )) || true
+                  [ "${DELETE,,}" = 'true' ] && DELETE_VERSION_ID+=($(aws s3api list-object-versions \
+                                                                      --endpoint-url="${B2_ENDPOINT_URL[n]}" \
+                                                                      --bucket "${B2_BUCKET[n]}" \
+                                                                      --prefix "${l}" \
+                                                                      --output json | awk -F '[",]' '/VersionId/{print $4}'))
+                fi
+              done
+
+              # 提交更改到 GitHub
+              git add .
+              git commit -m "Add files from Backblaze B2 ${B2_ACCOUNT_NAME[n]}" || echo "No changes to commit"
+              git push -f && SUCCESS_UPDATE=true || echo "No changes to push"
+              cd ..
+              if [ "${SUCCESS_UPDATE}" = 'true' ]; then
+                # 删除已经迁移的文件
+                if [ "${DELETE,,}" = 'true' ]; then
+                  COPY_OR_MOVE='迁移'
+                  echo "Delete files from Backblaze B2 ${B2_ACCOUNT_NAME[n]}"
+                  for q in ${!DELETE_VERSION_ID[@]}; do
+                    aws s3api delete-object \
+                      --endpoint-url="${B2_ENDPOINT_URL[n]}" \
+                      --bucket "${B2_BUCKET[n]}" \
+                      --key "${NEED_MOVE_FILE[q]}" \
+                      --version-id "${DELETE_VERSION_ID[q]}"
+                  done
+                else
+                  COPY_OR_MOVE='复制'
+                fi
+
+                # 根据成功和失败的文件个数，反馈结果
+                if [[ "$B2_DOWNLOAD_FAIL" -gt 0 && "${B2_DOWNLOAD_SUCCESS}" = 0 ]]; then
+                  REPORT+="\nWarning: ${B2_ACCOUNT_NAME[n]} 每天下载总量大于 1GB，中止本桶的操作"
+                elif [[ "$B2_DOWNLOAD_FAIL" -gt 0 && "${B2_DOWNLOAD_SUCCESS}" -gt 0 ]]; then
+                  REPORT+="\n已成功${COPY_OR_MOVE} Backblaze B2 ${B2_ACCOUNT_NAME[n]} ${B2_DOWNLOAD_SUCCESS} 个文件 ---> ${REPO_NAME}\n但由于每天下载总量大于 1GB，有 ${B2_DOWNLOAD_FAIL} 个文件没有${COPY_OR_MOVE}"
+                elif [[ "$B2_DOWNLOAD_FAIL" = 0 && "${B2_DOWNLOAD_SUCCESS}" -gt 0 ]]; then
+                  REPORT+="\n已成功${COPY_OR_MOVE} Backblaze B2 ${B2_ACCOUNT_NAME[n]} ${#NEED_MOVE_FILE[@]} 个文件 ---> ${REPO_NAME}"
+                fi
+
+                if [ "${#SKIP_FILE[@]}" -gt 0 ]; then
+                  [ "${#SKIP_FILE[@]}" = 1 ] && REPORT+="\nWarning: ${B2_ACCOUNT_NAME[n]} 1 个文件大于 100MB，不能${COPY_OR_MOVE}到 ${REPO_NAME}，是 ${SKIP_FILE[@]#*/}" || REPORT+="\nWarning: ${B2_ACCOUNT_NAME[n]} ${#SKIP_FILE[@]} 个文件大于 100MB，不能${COPY_OR_MOVE}到 ${REPO_NAME}，分别是 ${SKIP_FILE[@]#*/}"
+                fi
+              else
+                REPORT+="\nGitHub: ${REPO_NAME} 更新失败"
+              fi
+            else
+              # 如果没有文件需要处理
+              REPORT+="\nBackblaze B2 ${B2_ACCOUNT_NAME[n]} 没有更新文件."
+            fi
+          done
+        fi
+
+        # 本地清理：删除临时克隆的仓库
         [ -d "${REPO_NAME}" ] && rm -rf "${REPO_NAME}"
 
-        # 打印总结
+        # 打印总结报告
         echo "================================="
         echo "总结:"
         echo "${STRATEGY_RESULT}"
