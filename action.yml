@@ -1,11 +1,6 @@
 name: "Storage to GitHub"
 description: "Transfer files from Cloudflare R2 and/or Backblaze B2 to GitHub repositories based on size or quantity strategy."
 author: "fscarmen2"
-inputs:
-  config_path:
-    description: "Path to the configuration YAML file."
-    required: true
-    default: "./config.yml"
 outputs:
   result:
     description: "Summary of the action's execution."
@@ -18,53 +13,71 @@ runs:
         # 脚本开始，输出起始日志
         echo "开始 Storage ---> GitHub 脚本"
 
-        # 读取并格式化配置文件，确保冒号后有空格，并移除特殊字符
-        CONFIG=$(sed 's/[<>]//g; s/:/: /g; s/:[[:space:]]\+/: /g' "${{ inputs.config_path }}")
+        # 从 Action runner 的 env 环境变量获取 ACCOUNT_ID, WORKER_NAME 和 API_TOKEN
+        ACCOUNT_ID="${{ env.ACCOUNT_ID }}"
+        WORKER_NAME="${{ env.WORKER_NAME }}"
+        API_TOKEN="${{ env.API_TOKEN }}"
 
-        # 检查并读取 R2 存储配置（如果存在）
-        if yq -e '.r2_accounts' <<< "$CONFIG" >/dev/null 2>&1; then
-          # 解析 R2 账户相关信息
-          R2_ACCOUNT_NAME=($(yq '.r2_accounts[].name' <<< "$CONFIG"))
-          R2_ACCOUNT_ID=($(yq '.r2_accounts[].account_id' <<< "$CONFIG"))
-          R2_ACCESS_KEY_ID=($(yq '.r2_accounts[].access_key_id' <<< "$CONFIG"))
-          R2_SECRET_ACCESS_KEY=($(yq '.r2_accounts[].secret_access_key' <<< "$CONFIG"))
-          R2_BUCKET=($(yq '.r2_accounts[].bucket' <<< "$CONFIG"))
-          R2_DIR=($(yq '.r2_accounts[].dir' <<< "$CONFIG"))
-          
+        [ -z "$ACCOUNT_ID" ] && SECRET+=(ACCOUNT_ID)
+        [ -z "$WORKER_NAME" ] && SECRET+=(WORKER_NAME)
+        [ -z "$API_TOKEN" ] && SECRET+=(API_TOKEN)
+        [ "${#SECRET[@]}" != '0' ] && echo "Secret 里缺少变量 ${SECRET[@]}，请检测！" && exit 1
+
+        # 获取 worker 包含账户信息的内容
+        WORKER=$(curl -s -X GET "https://api.cloudflare.com/client/v4/accounts/$ACCOUNT_ID/workers/scripts/$WORKER_NAME" \
+             -H "Authorization: Bearer $API_TOKEN" \
+             -H "Content-Type: application/json" | sed -n '/name="worker.js"/,/async function getSignedUrl/p')
+
+        # 获取 R2 账户信息
+        R2_ACCOUNT_NAME=($(sed -n '/const R2_CONFIGS = \[/,/\];/p' <<< "$WORKER" | grep -oP "name:\s*'\K[^']+")) || true
+        R2_ACCOUNT_ID=($(sed -n '/const R2_CONFIGS = \[/,/\];/p' <<< "$WORKER" | grep -oP "accountId:\s*'\K[^']+")) || true
+        R2_ACCESS_KEY_ID=($(sed -n '/const R2_CONFIGS = \[/,/\];/p' <<< "$WORKER" | grep -oP "accessKeyId:\s*'\K[^']+")) || true
+        R2_SECRET_ACCESS_KEY=($(sed -n '/const R2_CONFIGS = \[/,/\];/p' <<< "$WORKER" | grep -oP "secretAccessKey:\s*'\K[^']+")) || true
+        R2_BUCKET=($(sed -n '/const R2_CONFIGS = \[/,/\];/p' <<< "$WORKER" | grep -oP "bucket:\s*'\K[^']+")) || true
+        if [ "${#R2_ACCOUNT_NAME[@]}" = '0' ]; then
+          echo "没有检测到任何 R2 账户"
+        elif [ "${#R2_ACCOUNT_NAME[@]}${#R2_ACCOUNT_ID[@]}${#R2_ACCESS_KEY_ID[@]}" = "${#R2_SECRET_ACCESS_KEY[@]}${#R2_BUCKET[@]}${#R2_ACCOUNT_NAME[@]}" ]; then
           # 构建 R2 存储的端点 URL
           for o in "${R2_ACCOUNT_ID[@]}"; do
             R2_ENDPOINT_URL+=(https://${o}.r2.cloudflarestorage.com)
           done
+        else
+          echo "R2 账户信息填写不完善，请检测"
         fi
 
-        # 检查并读取 B2 存储配置（如果存在）
-        if yq -e '.b2_accounts' <<< "$CONFIG" >/dev/null 2>&1; then
-          # 解析 B2 账户相关信息
-          B2_ACCOUNT_NAME=($(yq '.b2_accounts[].name' <<< "$CONFIG"))
-          B2_ENDPOINT=($(yq '.b2_accounts[].endpoint' <<< "$CONFIG"))
-          B2_KEY_ID=($(yq '.b2_accounts[].key_id' <<< "$CONFIG"))
-          B2_APPLICATION_KEY=($(yq '.b2_accounts[].application_key' <<< "$CONFIG"))
-          B2_BUCKET=($(yq '.b2_accounts[].bucket' <<< "$CONFIG"))
-          B2_DIR=($(yq '.b2_accounts[].dir' <<< "$CONFIG"))
-          
+        # 获取 B2 账户信息
+        B2_ACCOUNT_NAME=($(sed -n '/const B2_CONFIGS = \[/,/\];/p' <<< "$WORKER" | grep -oP "name:\s*'\K[^']+")) || true
+        B2_ENDPOINT=($(sed -n '/const B2_CONFIGS = \[/,/\];/p' <<< "$WORKER" | grep -oP "endPoint:\s*'\K[^']+")) || true
+        B2_KEY_ID=($(sed -n '/const B2_CONFIGS = \[/,/\];/p' <<< "$WORKER" | grep -oP "keyId:\s*'\K[^']+")) || true
+        B2_APPLICATION_KEY=($(sed -n '/const B2_CONFIGS = \[/,/\];/p' <<< "$WORKER" | grep -oP "applicationKey:\s*'\K[^']+")) || true
+        B2_BUCKET=($(sed -n '/const B2_CONFIGS = \[/,/\];/p' <<< "$WORKER" | grep -oP "bucket:\s*'\K[^']+")) || true
+        if [ "${#B2_ACCOUNT_NAME[@]}" = '0' ]; then
+          echo "没有检测到任何 B2 账户"
+        elif [ "${#B2_ACCOUNT_NAME[@]}${#B2_ENDPOINT[@]}${#B2_KEY_ID[@]}" = "${#B2_APPLICATION_KEY[@]}${#B2_BUCKET[@]}${#B2_ACCOUNT_NAME[@]}" ]; then
           # 构建 B2 存储的端点 URL
           for p in "${B2_ENDPOINT[@]}"; do
             B2_ENDPOINT_URL+=(https://${p})
           done
+        else
+          echo "B2 账户信息填写不完善，请检测"
         fi
 
-        # 从配置文件中读取 GitHub 相关参数
-        GITHUB_PAT=$(yq '.github_pat' <<< "$CONFIG")  # GitHub 个人访问令牌
-        GITHUB_REPO_PREFIX=$(yq '.github_repo_prefix' <<< "$CONFIG")  # GitHub 仓库前缀
-        GITHUB_REPO_LIST=($(yq '.gitlab_pats | keys | .[]' <<< "$CONFIG" | sed "s/^/${GITHUB_REPO_PREFIX}&/g"))  # 仓库列表
-        GITHUB_USERNAME=$(curl --silent --header "Authorization: Bearer $GITHUB_PAT" https://api.github.com/user | awk -F '"' '/"login":/{print $4}')  # GitHub 用户名
+        # 获取 GitHub 账户信息
+        GITHUB_PAT=$(sed -n "s/^const GITHUB_PAT = '\(.*\)'.*/\1/gp" <<< "$WORKER") # GitHub 个人访问令牌
+        GITHUB_REPO=($(sed -n '/const GITLAB_CONFIGS = \[/,/\];/p' <<< "$WORKER" | grep -oP "name:\s*'\K[^']+"))  # 仓库列表
+        GITHUB_USERNAME=$(sed -n "s/^const GITHUB_USERNAME = '\(.*\)'.*/\1/gp" <<< "$WORKER")  # GitHub 用户名
 
-        # 获取迁移策略和是否删除原文件的配置
-        STRATEGY=$(yq '.strategy' <<< "$CONFIG")  # 迁移策略
-        DELETE=$(yq '.delete' <<< "$CONFIG")  # 是否删除已迁移文件
+        # GitHub 和 GitLab 文件存放目录
+        DIR=$(sed -n "s/^const DIR = '\(.*\)'.*/\1/gp" <<< "$WORKER")
+
+        # 获取迁移策略
+        STRATEGY=$(sed -n "s/^const STRATEGY = '\(.*\)'.*/\1/gp" <<< "$WORKER")  # 迁移策略
+
+        # 是否删除原文件的配置
+        DELETE=$(sed -n "s/^const DELETE = '\(.*\)'.*/\1/gp" <<< "$WORKER")  # 是否删除已迁移文件
 
         # 检查策略是否直接指定了仓库
-        for j in ${GITHUB_REPO_LIST[@]}; do
+        for j in ${GITHUB_REPO[@]}; do
           grep -qw "${STRATEGY}" <<< "$j" && REPO_NAME="${STRATEGY}" && break
         done
 
@@ -78,41 +91,41 @@ runs:
           MIN_FILE_QUANTITY=$(curl --silent \
           --header "Authorization: token ${GITHUB_PAT}" \
           --header "Accept: application/vnd.github.v3+json" \
-          https://api.github.com/repos/${GITHUB_USERNAME}/${GITHUB_REPO_LIST[0]}/contents/${R2_DIR} | grep -c '"name"')
+          https://api.github.com/repos/${GITHUB_USERNAME}/${GITHUB_REPO[0]}/contents/${DIR} | grep -c '"name"')
 
           # 遍历仓库，找到文件数量最少的仓库
-          for ((i=1; i<${#GITHUB_REPO_LIST[@]}; i++)); do
+          for ((i=1; i<${#GITHUB_REPO[@]}; i++)); do
             REPO_FILE_QUANTITY[i]=$(curl --silent \
             --header "Authorization: token ${GITHUB_PAT}" \
             --header "Accept: application/vnd.github.v3+json" \
-            https://api.github.com/repos/${GITHUB_USERNAME}/${GITHUB_REPO_LIST[i]}/contents/${R2_DIR} | grep -c '"name"')
+            https://api.github.com/repos/${GITHUB_USERNAME}/${GITHUB_REPO[i]}/contents/${DIR} | grep -c '"name"')
             if [[ "$MIN_FILE_QUANTITY" -gt "${REPO_FILE_QUANTITY[i]}" ]]; then
               MIN_FILE_QUANTITY="${REPO_FILE_QUANTITY[i]}"
               MIN_INDEX="$i"
             fi
           done
-          REPO_NAME=${GITHUB_REPO_LIST[MIN_INDEX]}
+          REPO_NAME=${GITHUB_REPO[MIN_INDEX]}
           STRATEGY_RESULT="策略: 存放到文件数量最少的 ${REPO_NAME}" # 选择文件数量最少的仓库
         else
           # 如果策略是基于仓库大小的最小策略
-          grep -qwE 'size|quantity' <<< "${STRATEGY,,}" || echo "Strategy 现在 [${STRATEGY}] 不可用， 将采用默认策略 size，可选项是 [size|quantity|$(sed 's/ /|/g' <<< "${GITHUB_REPO_LIST[@]}")]"
+          grep -qwE 'size|quantity' <<< "${STRATEGY,,}" || echo "Strategy 现在 [${STRATEGY}] 不可用， 将采用默认策略 size，可选项是 [size|quantity|$(sed 's/ /|/g' <<< "${GITHUB_REPO[@]}")]"
           MIN_INDEX=0
           MIN_REPO_SIZE=$(curl --silent \
           --header "Authorization: token ${GITHUB_PAT}" \
           --header "Accept: application/vnd.github.v3+json" \
-          https://api.github.com/repos/${GITHUB_USERNAME}/${GITHUB_REPO_LIST[0]}/contents/${R2_DIR} | awk -F '[:,]' '/"size":/{print $2}' | awk '{s+=$1} END {print s}') # 获取第一个仓库的大小
+          https://api.github.com/repos/${GITHUB_USERNAME}/${GITHUB_REPO[0]}/contents/${DIR} | awk -F '[:,]' '/"size":/{print $2}' | awk '{s+=$1} END {print s}') # 获取第一个仓库的大小
 
           # 遍历仓库，找到容量最小的仓库
-          for ((i=1; i<${#GITHUB_REPO_LIST[@]}; i++)); do
+          for ((i=1; i<${#GITHUB_REPO[@]}; i++)); do
             REPO_SIZE[i]=$(curl --silent --header "Authorization: token ${GITHUB_PAT}" \
             --header "Accept: application/vnd.github.v3+json" \
-            https://api.github.com/repos/${GITHUB_USERNAME}/${GITHUB_REPO_LIST[i]}/contents/${R2_DIR} | awk -F '[:,]' '/"size":/{print $2}' | awk '{s+=$1} END {print s}') # 获取其他仓库的大小
+            https://api.github.com/repos/${GITHUB_USERNAME}/${GITHUB_REPO[i]}/contents/${DIR} | awk -F '[:,]' '/"size":/{print $2}' | awk '{s+=$1} END {print s}') # 获取其他仓库的大小
             if [[ "$MIN_REPO_SIZE" -gt "${REPO_SIZE[i]}" ]]; then
               MIN_REPO_SIZE="${REPO_SIZE[i]}"
               MIN_INDEX="$i"
             fi
           done
-          REPO_NAME=${GITHUB_REPO_LIST[MIN_INDEX]}
+          REPO_NAME=${GITHUB_REPO[MIN_INDEX]}
           STRATEGY_RESULT="策略: 存放到仓库容量最少的 ${REPO_NAME}" # 选择容量最小的仓库
         fi
 
@@ -125,7 +138,7 @@ runs:
         aws configure set output json
 
         # 处理 R2 存储（如果存在）
-        if [ ${#R2_ACCOUNT_NAME[@]} -gt 0 ]; then
+        if [ "${#R2_ENDPOINT_URL[@]}" -gt 0 ]; then
           # 遍历所有 R2 账户
           for n in ${!R2_ACCOUNT_NAME[@]}; do
             # 配置 AWS 凭据（用于访问 R2）
@@ -200,7 +213,7 @@ runs:
 
         # 处理 B2 存储（如果存在）
         # 这部分代码逻辑与 R2 处理基本相同，主要区别在于处理 B2 存储的特定细节
-        if [ ${#B2_ACCOUNT_NAME[@]} -gt 0 ]; then
+        if [ "${#B2_ENDPOINT_URL[@]}" -gt 0 ]; then
           for n in ${!B2_ACCOUNT_NAME[@]}; do
             aws configure set aws_access_key_id ${B2_KEY_ID[n]}
             aws configure set aws_secret_access_key ${B2_APPLICATION_KEY[n]}
