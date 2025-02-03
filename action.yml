@@ -251,7 +251,12 @@ runs:
               for l in "${NEED_MOVE_FILE[@]}"; do
                 (( FILE_COUNTER++ )) || true
                 echo "${B2_ACCOUNT_NAME[n]} copying ${FILE_COUNTER} / ${#NEED_MOVE_FILE[@]} : ${l#*/}"
-                B2_DOWNLOAD_QUOTA=$(aws s3 cp --endpoint-url=${B2_ENDPOINT_URL[n]} s3://${B2_BUCKET[n]}/${l} ${l} 2>&1) || true
+
+                # 动态应用 DIR 配置
+                TARGET_PATH="${DIR}/${l##*/}"
+                mkdir -p "$(dirname "$TARGET_PATH")"
+                
+                B2_DOWNLOAD_QUOTA=$(aws s3 cp --endpoint-url=${B2_ENDPOINT_URL[n]} s3://${B2_BUCKET[n]}/${l} "$TARGET_PATH" 2>&1) || true
                 if grep -q "operation: Forbidden" <<< "${B2_DOWNLOAD_QUOTA}"; then
                   (( B2_DOWNLOAD_FAIL++ )) || true
                   break
@@ -266,8 +271,8 @@ runs:
               done
 
               # 提交更改到 GitHub
-              git add .
-              git commit -m "Add files from Backblaze B2 ${B2_ACCOUNT_NAME[n]}" || echo "No changes to commit"
+              git add "$DIR"
+              git commit -m "Add files from Backblaze B2 ${B2_ACCOUNT_NAME[n]} to ${DIR}" || echo "No changes to commit"
               git push -f && SUCCESS_UPDATE=true || echo "No changes to push"
               cd ..
               if [ "${SUCCESS_UPDATE}" = 'true' ]; then
